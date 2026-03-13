@@ -12,8 +12,6 @@
 #include "rclcpp/qos.hpp"
 #include "sensor_msgs/msg/compressed_image.hpp"
 #include "sensor_msgs/msg/image.hpp"
-
-// Updated header for Jazzy
 #include "cv_bridge/cv_bridge.hpp" 
 #include "sensor_msgs/image_encodings.hpp"
 
@@ -24,28 +22,15 @@ extern "C" {
     #include <libavutil/imgutils.h>
 }
 
-static enum AVPixelFormat get_hw_format(AVCodecContext *ctx, const enum AVPixelFormat *pix_fmts) {
-    const enum AVPixelFormat *p;
-    for (p = pix_fmts; *p != AV_PIX_FMT_NONE; p++) {
-        if (*p == AV_PIX_FMT_CUDA) {
-            return *p;
-        }
-    }
-    return AV_PIX_FMT_NONE;
-}
-
 class H264DecoderNode : public rclcpp::Node {
 private:
-    const AVCodec* codec_ = nullptr; // Modern FFmpeg uses const AVCodec*
+    const AVCodec* codec_ = nullptr;
     AVCodecContext* codec_ctx_ = nullptr;
     AVCodecParserContext* parser_ctx_ = nullptr;
     AVPacket* pkt_ = nullptr;
     AVFrame* hw_frame_ = nullptr;
-    AVFrame* sw_frame_ = nullptr;
     SwsContext* sws_ctx_ = nullptr;
     cv::Mat bgr_frame_; 
-    AVBufferRef *hw_device_ctx_ = nullptr;
-    enum AVHWDeviceType hw_type_ = AV_HWDEVICE_TYPE_NONE;
 
     rclcpp::Subscription<sensor_msgs::msg::CompressedImage>::SharedPtr subscription_;
     rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr publisher_;
@@ -62,35 +47,19 @@ private:
     bool i_frame_only_ = false;
 
     void InitFFmpegDecoder() {
-        hw_type_ = AV_HWDEVICE_TYPE_CUDA;
-        const char* decoder_name = "h264_cuvid";
-
-        codec_ = avcodec_find_decoder_by_name(decoder_name);
+        // Force Software H.264 Decoder for NUC compatibility
+        codec_ = avcodec_find_decoder(AV_CODEC_ID_H264);
         if (!codec_) {
-            RCLCPP_WARN(this->get_logger(), "CUDA decoder not found, trying software H.264");
-            hw_type_ = AV_HWDEVICE_TYPE_NONE;
-            codec_ = avcodec_find_decoder(AV_CODEC_ID_H264);
-        }
-
-        if (!codec_) {
-            RCLCPP_ERROR(this->get_logger(), "No H.264 decoder available at all");
+            RCLCPP_ERROR(this->get_logger(), "No H.264 decoder available!");
             return;
-        }
-
-        if (hw_type_ != AV_HWDEVICE_TYPE_NONE) {
-            int err = av_hwdevice_ctx_create(&hw_device_ctx_, hw_type_, nullptr, nullptr, 0);
-            if (err < 0) {
-                RCLCPP_WARN(this->get_logger(), "Failed to create hardware context, using software");
-                hw_type_ = AV_HWDEVICE_TYPE_NONE;
-            }
         }
 
         parser_ctx_ = av_parser_init(codec_->id);
         codec_ctx_ = avcodec_alloc_context3(codec_);
         
-        if (hw_type_ != AV_HWDEVICE_TYPE_NONE && hw_device_ctx_) {
-            codec_ctx_->hw_device_ctx = av_buffer_ref(hw_device_ctx_);
-            codec_ctx_->get_format = get_hw_format;
+        if (!codec_ctx_) {
+            RCLCPP_ERROR(this->get_logger(), "Failed to allocate codec context");
+            return;
         }
 
         if (avcodec_open2(codec_ctx_, codec_, nullptr) < 0) {
@@ -100,7 +69,6 @@ private:
 
         pkt_ = av_packet_alloc();
         hw_frame_ = av_frame_alloc();
-        sw_frame_ = av_frame_alloc();
     }
 
     void PublisherThreadLoop() {
@@ -124,7 +92,6 @@ private:
                 header.stamp = this->get_clock()->now();
                 header.frame_id = "camera_frame";
                 
-                // Jazzy: cv_bridge::CvImage usage
                 cv_bridge::CvImage cv_image(header, sensor_msgs::image_encodings::BGR8, frame_to_publish);
                 cv_image.toImageMsg(*img_msg);
                 publisher_->publish(std::move(img_msg));
@@ -140,21 +107,14 @@ private:
             if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
             if (ret < 0) return;
 
+            // In software mode, the frame is directly in system memory
             AVFrame* frame_to_display = hw_frame_;
-
-            if (hw_frame_->format == AV_PIX_FMT_CUDA) {
-                if (av_hwframe_transfer_data(sw_frame_, hw_frame_, 0) < 0) {
-                    av_frame_unref(hw_frame_);
-                    continue;
-                }
-                frame_to_display = sw_frame_;
-            }
 
             if (!sws_ctx_ && frame_to_display->width > 0) {
                 sws_ctx_ = sws_getContext(
                     frame_to_display->width, frame_to_display->height, (AVPixelFormat)frame_to_display->format,
                     frame_to_display->width, frame_to_display->height, AV_PIX_FMT_BGR24,
-                    SWS_POINT, nullptr, nullptr, nullptr);
+                    SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
                 bgr_frame_.create(frame_to_display->height, frame_to_display->width, CV_8UC3);
             }
 
@@ -179,12 +139,10 @@ private:
 
     void CleanupFFmpegDecoder() {
         if (sws_ctx_) sws_freeContext(sws_ctx_);
-        if (sw_frame_) av_frame_free(&sw_frame_);
         if (hw_frame_) av_frame_free(&hw_frame_);
         if (pkt_) av_packet_free(&pkt_);
-        if (codec_ctx_) avcodec_free_context(&codec_ctx_); // Replaced avcodec_close
+        if (codec_ctx_) avcodec_free_context(&codec_ctx_);
         if (parser_ctx_) av_parser_close(parser_ctx_);
-        if (hw_device_ctx_) av_buffer_unref(&hw_device_ctx_);
     }
 
     void compressed_image_callback(const sensor_msgs::msg::CompressedImage::SharedPtr msg) {

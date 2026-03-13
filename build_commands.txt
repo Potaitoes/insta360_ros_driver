@@ -1,0 +1,4 @@
+cd ~/ros2_ws
+rm -rf build install log
+source /opt/ros/jazzy/setup.bash
+colcon build --symlink-install
